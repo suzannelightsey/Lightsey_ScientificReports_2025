@@ -1,0 +1,898 @@
+---
+title: "Lightsey_ScientificReports_2025"
+author: "Suzanne Lightsey"
+date: "2025-10-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.retina = 2)
+
+# Paths
+data_file   <- "~/Desktop/RNAseq_Data_Analysis.xlsx" 
+results_dir <- "results"
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Thresholds
+sig_thresh   <- 0.05
+logfc_thresh <- 0.58  # ~1.5-fold
+
+# OPTIONAL: run once to install dependencies (uncomment run in interactive session)
+packages <- c(
+  "tidyverse","data.table","ggrepel","ComplexHeatmap","circlize","pheatmap",
+   "RColorBrewer","matrixStats","GSVA","BiocParallel","ashr","corrplot","scales",
+   "UpSetR","VennDiagram","grid","ggplotify","ggplot2","readxl","limma"
+ )
+ bioc_packages <- c(
+   "DESeq2","edgeR","fgsea","msigdbr","biomaRt","AnnotationDbi",
+   "org.Hs.eg.db","clusterProfiler","ReactomePA","GSVA","BiocParallel"
+ )
+ cran_missing <- setdiff(packages, rownames(installed.packages()))
+ if(length(cran_missing)) install.packages(cran_missing)
+ if(!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+ bioc_missing <- setdiff(bioc_packages, rownames(installed.packages()))
+ if(length(bioc_missing)) BiocManager::install(bioc_missing, update = TRUE, ask = FALSE)
+```
+
+```{r}
+# Load libraries (suppress startup messages)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(ggrepel)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(matrixStats)
+  library(GSVA)
+  library(BiocParallel)
+  library(ashr)
+  library(corrplot)
+  library(scales)
+  library(UpSetR)
+  library(VennDiagram)
+  library(grid)
+  library(ggplotify)
+  library(ggplot2)
+  library(readxl)
+
+  library(DESeq2)
+  library(edgeR)
+  library(fgsea)
+  library(msigdbr)
+  library(biomaRt)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+  library(clusterProfiler)
+  library(ReactomePA)
+  library(limma)
+})
+
+```
+
+```{r}
+# Helper functions
+sum_duplicates <- function(df) {
+  df %>%
+    group_by(Gene) %>%
+    summarise(across(everything(), ~ sum(.x, na.rm = TRUE))) %>%
+    as.data.frame()
+}
+
+mean_duplicates <- function(df) {
+  df %>%
+    group_by(Gene) %>%
+    summarise(across(everything(), ~ mean(.x, na.rm = TRUE))) %>%
+    as.data.frame()
+}
+
+load_and_process <- function(file, sheet, method = c("sum", "mean")) {
+  method <- match.arg(method)
+  df <- read_excel(file, sheet = sheet) %>% as.data.frame()
+  colnames(df)[1] <- "Gene"
+  if (method == "sum") df <- sum_duplicates(df)
+  if (method == "mean") df <- mean_duplicates(df)
+  rownames(df) <- df$Gene
+  df$Gene <- NULL
+  as.matrix(df)
+}
+
+# Load data
+if (!file.exists(data_file)) stop("Data file not found at: ", data_file)
+raw_counts      <- load_and_process(data_file, "Raw", method = "sum")
+filtered_counts <- load_and_process(data_file, "Filtered", method = "sum")
+cpm             <- load_and_process(data_file, "CPM", method = "mean")
+lcpm            <- load_and_process(data_file, "LCPM", method = "mean")
+
+metadata <- read_excel(data_file, sheet = "MetaData") %>% as.data.frame()
+
+# Basic checks: metadata must have Sample and Group columns
+if(!all(c("Sample", "Group") %in% colnames(metadata))) {
+  stop("MetaData sheet must contain columns named 'Sample' and 'Group'")
+}
+
+# Ensure columns of expression matrices match metadata$Sample
+expr_cols <- colnames(filtered_counts)
+if(!all(metadata$Sample %in% expr_cols)) {
+  stop("Metadata$Sample names must match column names of count matrices")
+}
+
+```
+
+```{r}
+# Create DGEList and run voom
+dge <- DGEList(counts = filtered_counts, group = metadata$Group)
+dge <- calcNormFactors(dge)
+design <- model.matrix(~0 + Group, data = metadata)
+colnames(design) <- make.names(colnames(design))
+
+v <- voom(dge, design = design, plot = FALSE)
+logCPM <- v$E
+
+# Fit model and eBayes
+fit <- lmFit(v, design)
+cont <- makeContrasts(
+  `3Dvs2D` = Group3D.Hydrogel - Group2D.Cell.Culture,
+  `2DvsInVivo` = Group2D.Cell.Culture - GroupIn.Vivo,
+  `3DvsInVivo` = Group3D.Hydrogel - GroupIn.Vivo,
+  `InVivovs2D` = GroupIn.Vivo - Group2D.Cell.Culture,
+  levels = design
+)
+fit2 <- contrasts.fit(fit, cont)
+fit2 <- eBayes(fit2)
+
+# Posterior variance (voom + eBayes)
+posterior_var <- fit$s2.post
+avg_expr <- rowMeans(v$E)
+
+# PCA
+pca <- prcomp(t(logCPM), scale. = TRUE)
+percentVar <- round(100 * (pca$sdev^2 / sum(pca$sdev^2)), 1)
+pca_df <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2], Sample = rownames(pca$x))
+pca_df <- left_join(pca_df, metadata, by = c("Sample" = "Sample"))
+
+group_colors <- c("2D Cell Culture" = "#1f78b4", "3D Hydrogel" =  "#b2df8a", "In Vivo" = "#a6cee3")
+
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Group, fill = Group)) +
+  geom_point(size = 4) +
+  stat_ellipse(geom = "polygon", alpha = 0.2, show.legend = FALSE, color = NA) +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values = group_colors) +
+  labs(title = "PCA of logCPM Expression",
+       x = paste0("PC1 (", percentVar[1], "%)"),
+       y = paste0("PC2 (", percentVar[2], "%)")) +
+  theme_bw(base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# Save plots
+ggsave(file.path(results_dir, "Fig2A_PCA.png"), p_pca, width = 10, height = 7, dpi = 300)
+
+p_pca
+
+```
+
+```{r}
+cor_mat <- cor(logCPM, method = "spearman", use = "pairwise.complete.obs")
+
+# match metadata ordering
+meta_order <- metadata$Group[match(colnames(logCPM), metadata$Sample)]
+tl_colors <- group_colors[meta_order]
+
+# plot using corrplot
+png(file.path(results_dir, "Fig2B_SpearmansCorrelation.png"), width = 1000, height = 1000, res = 150)
+corrplot(cor_mat, method = "circle", type = "full", tl.col = tl_colors, tl.cex = 0.8,
+         order = "original", addgrid.col = "grey", cl.pos = "r", cl.ratio = 0.2,
+         cl.cex = 0.8, diag = TRUE, mar = c(1,1,1,1), is.corr = TRUE)
+dev.off()
+
+# Average group correlations table
+groups <- metadata$Group[match(colnames(logCPM), metadata$Sample)]
+unique_groups <- unique(groups)
+avg_group_corr <- matrix(NA, nrow = length(unique_groups), ncol = length(unique_groups),
+                         dimnames = list(unique_groups, unique_groups))
+for(g1 in unique_groups) for(g2 in unique_groups) {
+  s1 <- colnames(logCPM)[groups == g1]
+  s2 <- colnames(logCPM)[groups == g2]
+  avg_group_corr[g1,g2] <- mean(cor_mat[s1,s2], na.rm = TRUE)
+}
+avg_group_corr
+```
+
+```{r}
+# gene variability (sd/mean)
+gene_var <- apply(logCPM, 1, function(x) sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE))
+top1000_var_genes <- names(sort(gene_var, decreasing = TRUE))[1:1000]
+
+# reorder metadata samples
+metadata <- metadata %>% mutate(Group = factor(Group, levels = c("2D Cell Culture", "3D Hydrogel", "In Vivo"))) %>% arrange(Group)
+
+logCPM_top1000 <- logCPM[top1000_var_genes, metadata$Sample]
+
+annotation_col <- data.frame(condition = metadata$Group)
+rownames(annotation_col) <- metadata$Sample
+
+blue_white_fuchsia <- colorRampPalette(c("#2166AC", "white", "#AF2958"))(100)
+
+pheatmap(logCPM_top1000, color = blue_white_fuchsia, scale = "row", cluster_rows = TRUE, cluster_cols = TRUE,
+         annotation_col = annotation_col, annotation_colors = list(condition = group_colors),
+         show_rownames = FALSE, show_colnames = TRUE, fontsize_row = 6, fontsize_col = 8,
+         main = "Top 1000 variable genes (logCPM, voom)",
+         filename = file.path(results_dir, "Fig2C_Top_1000_logCPM.png"), width = 10, height = 12)
+
+```
+
+```{r}
+expr_mat <- as.matrix(logCPM)
+mode(expr_mat) <- "numeric"
+
+# Hallmark gene sets
+hallmark <- msigdbr(species = "Homo sapiens", collection = "H")
+hallmark_list <- split(x = hallmark$gene_symbol, f = hallmark$gs_name)
+hallmark_list <- hallmark_list[sapply(hallmark_list, length) > 0]
+
+# Keep only genes that exist in your expression matrix
+hallmark_list <- lapply(hallmark_list, function(x) x[x %in% rownames(expr_mat)])
+
+pathway_scores <- sapply(hallmark_list, function(genes) {
+  colMeans(expr_mat[genes, , drop = FALSE])
+})
+
+# Run GSVA
+param_res <- gsvaParam(expr_mat, hallmark_list)
+gsva_res <- gsva(param_res)
+gsva_res <- as.matrix(gsva_res)
+# Z-score all pathways (row scaling)
+pathway_scaled_GSVA <- t(scale(t(gsva_res)))
+
+# Clean up pathway names
+rownames(pathway_scaled_GSVA) <- gsub("^HALLMARK_", "", rownames(pathway_scaled_GSVA))
+rownames(pathway_scaled_GSVA) <- gsub("_", " ", rownames(pathway_scaled_GSVA))
+rownames(pathway_scaled_GSVA) <- stringr::str_to_title(rownames(pathway_scaled_GSVA))
+
+# Define sample annotation
+sample_annotation <- data.frame(Group = metadata$Group)
+rownames(sample_annotation) <- colnames(pathway_scaled_GSVA)
+
+# Plot heatmap
+pheatmap(
+  pathway_scaled_GSVA,
+  color = blue_white_fuchsia,
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  annotation_col = sample_annotation,
+  annotation_colors = list(Group = group_colors),
+  main = "Hallmark Pathway Scores (GSVA, Z-scored)",
+  filename = file.path(results_dir, "Fig2D_hallmark_heatmap_GSVA.png"),
+  width = 12,
+  height = 20
+)
+
+
+```
+
+```{r}
+# Collect results with topTable for every contrast
+res_list <- lapply(colnames(cont), function(coef) {
+  df <- topTable(fit2, coef = coef, number = Inf, sort.by = "P")
+  df$SYMBOL <- rownames(df)
+  df
+})
+names(res_list) <- colnames(cont)
+
+# Unpack
+res_3Dvs2D    <- res_list[["3Dvs2D"]]
+res_2DvsInVivo <- res_list[["2DvsInVivo"]]
+res_3DvsInVivo <- res_list[["3DvsInVivo"]]
+res_InVivovs2D <- res_list[["InVivovs2D"]]
+
+# DEG sets
+up_3Dvs2D   <- rownames(subset(res_3Dvs2D, adj.P.Val < sig_thresh & logFC > logfc_thresh))
+down_3Dvs2D <- rownames(subset(res_3Dvs2D, adj.P.Val < sig_thresh & logFC < -logfc_thresh))
+up_2DvsInVivo   <- rownames(subset(res_2DvsInVivo, adj.P.Val < sig_thresh & logFC > logfc_thresh))
+down_2DvsInVivo <- rownames(subset(res_2DvsInVivo, adj.P.Val < sig_thresh & logFC < -logfc_thresh))
+up_3DvsInVivo   <- rownames(subset(res_3DvsInVivo, adj.P.Val < sig_thresh & logFC > logfc_thresh))
+down_3DvsInVivo <- rownames(subset(res_3DvsInVivo, adj.P.Val < sig_thresh & logFC < -logfc_thresh))
+
+sig_list <- list(
+  "2D vs In Vivo" = rownames(subset(res_2DvsInVivo, adj.P.Val < sig_thresh & abs(logFC) > logfc_thresh)),
+  "3D vs In Vivo" = rownames(subset(res_3DvsInVivo, adj.P.Val < sig_thresh & abs(logFC) > logfc_thresh)),
+  "3D vs 2D"      = rownames(subset(res_3Dvs2D, adj.P.Val < sig_thresh & abs(logFC) > logfc_thresh))
+)
+
+```
+
+```{r}
+png(file.path(results_dir, "Fig3A_DEGs_Venn.png"), width = 1500, height = 1500, res = 150)
+venn.diagram(
+  x = sig_list,
+  category.names = c("2D vs In Vivo", "3D vs In Vivo", "3D vs 2D"),
+  filename = NULL,
+  fill = c("#1f78b4","#b2df8a", "#9AA0A6"),
+  alpha = 0.5,
+  cex = 3,
+  cat.cex = 1.2,
+  height = 2000,
+  width = 2000,
+  resolution = 300,
+  main = "DEGs Overlap Across 3 Comparisons"
+) -> venn_plot
+grid::grid.draw(venn_plot)
+dev.off()
+```
+
+```{r}
+png(file.path(results_dir, "Fig3B_DEGs_UpSet.png"), width = 1500, height = 1000, res = 150)
+upset(fromList(sig_list),
+      order.by = "freq",
+      text.scale = c(3, 3, 2, 2, 2, 3),
+      keep.order = TRUE,
+      point.size = 4,
+      line.size = 1.5,
+      main.bar.color = "#3D3D3D",
+      sets.bar.color = c("#1f78b4", "#9AA0A6", "#b2df8a"))
+dev.off()
+```
+
+```{r}
+count_DEGs <- function(res, pval_thresh, logfc_thresh) {
+  up   <- sum(res$adj.P.Val < pval_thresh & res$logFC > logfc_thresh, na.rm = TRUE)
+  down <- sum(res$adj.P.Val < pval_thresh & res$logFC < -logfc_thresh, na.rm = TRUE)
+  data.frame(Up = up, Down = down)
+}
+
+deg_summary <- rbind(
+  "2D vs In Vivo" = count_DEGs(res_2DvsInVivo, sig_thresh, logfc_thresh),
+  "3D vs In Vivo" = count_DEGs(res_3DvsInVivo, sig_thresh, logfc_thresh),
+  "3D vs 2D"      = count_DEGs(res_3Dvs2D, sig_thresh, logfc_thresh)
+)
+deg_summary
+```
+
+```{r}
+nondeg_list <- list()
+for(contrast in names(res_list)) {
+  res <- res_list[[contrast]]
+  nondeg_genes <- rownames(subset(res, !(adj.P.Val < sig_thresh & abs(logFC) > logfc_thresh)))
+  nondeg_list[[paste0(contrast, "_nonDEG")]] <- nondeg_genes
+}
+str(nondeg_list)
+
+```
+
+```{r}
+rescued_subset <- list(
+  "2DvsInVivo_DEG" = sig_list[["2D vs In Vivo"]],
+  "3DvsInVivo_nonDEG" = nondeg_list[["3DvsInVivo_nonDEG"]]
+)
+
+png(file.path(results_dir, "Fig4A_RestoredGenes_Venn.png"), width = 1500, height = 1500, res = 150)
+venn.diagram(x = rescued_subset,
+             category.names = c("2DvsInVivo_DEG", "3DvsInVivo_nonDEG"),
+             filename = NULL,
+             fill = c("#1f78b4","#b2df8a"),
+             alpha = 0.5,
+             cex = 3,
+             cat.cex = 1.2,
+             height = 2000,
+             width = 2000,
+             resolution = 300) -> venn_plot2
+grid::grid.draw(venn_plot2)
+dev.off()
+```
+
+```{r}
+# Parameters
+padj_cut <- 0.05
+lfc_cut  <- 0.58   # minimal effect size for meaningful change
+lfc_small <- 0.1   # threshold to consider "close to zero" for 3D vs in vivo
+
+# RENAME
+res_inv2d_df <- res_InVivovs2D
+res_3d_inv_df <- res_3DvsInVivo
+
+# Define restored genes
+restored <- res_inv2d_df %>%
+  select(SYMBOL, log2FC_inv = logFC, padj_inv = adj.P.Val) %>%
+  left_join(res_3d_inv_df %>% select(SYMBOL, log2FC_3d = logFC, padj_3d = adj.P.Val),
+            by = "SYMBOL") %>%
+  # criteria: DE in inv vs 2D, not DE in 3D vs inv, effect sizes sensible
+  filter(!is.na(log2FC_inv)) %>%
+  filter(padj_inv < padj_cut,
+         abs(log2FC_inv) > lfc_cut,
+         (is.na(padj_3d) | padj_3d > 0.1),                 # 3D not significant vs inv
+         (is.na(log2FC_3d) | abs(log2FC_3d) < lfc_small))  # 3D change small
+
+
+# Enrichment (clusterProfiler)
+
+# Define universe of testable genes
+testable_genes <- res_inv2d_df %>%
+  inner_join(res_3d_inv_df, by = "SYMBOL") %>%
+  pull(SYMBOL)
+
+testable_entrez <- bitr(testable_genes, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")$ENTREZID
+
+
+# Map genes to Entrez IDs
+gene2entrez <- bitr(restored$SYMBOL, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+entrez_restored <- gene2entrez$ENTREZID# Add universe to enrichment calls
+ego <- enrichGO(entrez_restored, 
+                universe = testable_entrez,  # ADD THIS
+                OrgDb = org.Hs.eg.db, ont = "BP",
+                pAdjustMethod = "BH", qvalueCutoff = 0.2)
+
+
+# GO
+ego <- enrichGO(entrez_restored, OrgDb = org.Hs.eg.db, ont = "BP",
+                pAdjustMethod = "BH", qvalueCutoff = 0.2, readable = TRUE)
+
+# KEGG
+ekegg <- enrichKEGG(entrez_restored, organism = "hsa",
+                    pAdjustMethod = "BH", qvalueCutoff = 0.2)
+
+
+# Convert and label
+df_go <- as.data.frame(ego) %>% mutate(Source = "GO")
+df_kegg <- as.data.frame(ekegg) %>% mutate(Source = "KEGG")
+
+
+# Hallmark
+
+# Get Hallmark pathways
+hallmark <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, gene_symbol) %>%
+  distinct()
+
+hallmark_entrez <- bitr(hallmark$gene_symbol, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)
+
+# Merge to create TERM2GENE with Entrez IDs
+hallmark_term2gene <- hallmark %>%
+  left_join(hallmark_entrez, by = c("gene_symbol" = "SYMBOL")) %>%
+  select(term = gs_name, gene = ENTREZID) %>%
+  filter(!is.na(gene))
+# Make sure restored genes have Entrez IDs
+restored_entrez <- bitr(restored$SYMBOL, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)
+entrez_restored <- restored_entrez$ENTREZID
+
+# Run enrichment
+ehallmark <- enricher(
+  gene = entrez_restored,
+  TERM2GENE = hallmark_term2gene,
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.2
+)
+
+if(!is.null(ehallmark) && nrow(ehallmark) > 0){
+  df_hallmark <- as.data.frame(ehallmark) %>% mutate(Source = "Hallmark")
+  df_hallmark <- df_hallmark %>%
+  mutate(Description = gsub("^HALLMARK_", "", Description) %>% 
+                      gsub("_", " ", .) %>% 
+                      str_to_title())
+  df_all<- bind_rows(df_go, df_kegg, df_hallmark)
+  df_all$Source <- factor(df_all$Source, 
+                               levels = c("Hallmark", "KEGG", "GO"))
+} else {
+  df_all <- bind_rows(df_go, df_kegg)
+  message("No Hallmark pathways enriched. Plotting GO/KEGG only.")
+}
+
+# Function to get top n pathways per database
+top_n_per_db <- function(df, n=10){
+  df %>%
+    filter(!is.na(Description) & !is.na(p.adjust)) %>%
+    arrange(p.adjust) %>%
+    slice_head(n=n) %>%
+    mutate(logP = -log10(p.adjust))
+}
+
+df_top <- bind_rows(
+  top_n_per_db(df_go),
+  top_n_per_db(df_kegg),
+  #top_n_per_db(df_react_nonDEG),
+  if(!is.null(df_hallmark)) top_n_per_db(df_hallmark) else NULL
+)
+
+
+# Order bars within each Source by descending logP
+df_top <- df_all %>%
+  filter(!is.na(Description), !is.na(p.adjust)) %>%
+  group_by(Source) %>%
+  arrange(p.adjust, .by_group = TRUE) %>%
+  slice_head(n = 10) %>%
+  mutate(
+    logP = -log10(p.adjust),
+    Description_wrapped = stringr::str_wrap(Description, width = 30)
+  ) %>%
+  ungroup()
+
+df_top <- df_top %>%
+  arrange(Source, desc(logP)) %>%
+  mutate(Description_ordered = factor(Description_wrapped, 
+                                      levels = rev(unique(Description_wrapped))))
+
+
+# Define fuchsia gradient colors per database
+database_colors <- c(
+  "GO" = "#AF2958",       
+  "KEGG" = "#7D3C98",   
+  "Hallmark" = "#2166AC"
+)
+
+
+# Plot
+ggplot(df_top, aes(x = Description_ordered, y = logP, fill = Source)) +
+  geom_col() +
+  scale_fill_manual(values = database_colors) +
+  labs(
+    x = "",
+    y = "-log10(p.adjust)",
+    fill = "Database",
+    title = "Enriched Terms and Pathways (Restored Genes)"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "right",
+    panel.border = element_rect(color = "black", fill = NA, size = 1),
+    axis.text.y = element_text(size = 14),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1)
+  )
+ggsave(file.path(results_dir, "Recovered_PathwayEnrichment.png"), width = 12, height = 8, dpi = 300)
+```
+
+```{r}
+#Scatterplot with categories (measuring Concordance)
+# Note: this plot has no labels (add labels manually in biorender)
+hallmark_to_category <- data.frame(
+  Pathway = c(
+    # Proliferation & Cell Cycle
+    "HALLMARK_E2F_TARGETS",
+    "HALLMARK_G2M_CHECKPOINT",
+    "HALLMARK_MYC_TARGETS_V1",
+    "HALLMARK_MYC_TARGETS_V2",
+    "HALLMARK_MITOTIC_SPINDLE",
+    "HALLMARK_DNA_REPAIR",
+    
+    # Growth Signaling & Oncogenic Pathways
+    "HALLMARK_PI3K_AKT_MTOR_SIGNALING",
+    "HALLMARK_MTORC1_SIGNALING",
+    "HALLMARK_KRAS_SIGNALING_UP",
+    "HALLMARK_KRAS_SIGNALING_DN",
+    "HALLMARK_WNT_BETA_CATENIN_SIGNALING",
+    "HALLMARK_HEDGEHOG_SIGNALING",
+    "HALLMARK_NOTCH_SIGNALING",
+    "HALLMARK_TGF_BETA_SIGNALING",
+    
+    # Metabolic Reprogramming
+    "HALLMARK_GLYCOLYSIS",
+    "HALLMARK_OXIDATIVE_PHOSPHORYLATION",
+    "HALLMARK_FATTY_ACID_METABOLISM",
+    "HALLMARK_ADIPOGENESIS",
+    "HALLMARK_BILE_ACID_METABOLISM",
+    "HALLMARK_CHOLESTEROL_HOMEOSTASIS",
+    "HALLMARK_HEME_METABOLISM",
+    "HALLMARK_PEROXISOME",
+    "HALLMARK_XENOBIOTIC_METABOLISM",
+    
+    # Stress Response & Hypoxia
+    "HALLMARK_HYPOXIA",
+    "HALLMARK_APOPTOSIS",
+    "HALLMARK_P53_PATHWAY",
+    "HALLMARK_REACTIVE_OXYGEN_SPECIES_PATHWAY",
+    "HALLMARK_UNFOLDED_PROTEIN_RESPONSE",
+    "HALLMARK_UV_RESPONSE_UP",
+    "HALLMARK_UV_RESPONSE_DN",
+    
+    # Immune & Inflammatory Signaling
+    "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+    "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+    "HALLMARK_INFLAMMATORY_RESPONSE",
+    "HALLMARK_IL2_STAT5_SIGNALING",
+    "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+    "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+    "HALLMARK_COMPLEMENT",
+    "HALLMARK_ALLOGRAFT_REJECTION",
+    
+    # Angiogenesis & Development
+    "HALLMARK_ANGIOGENESIS",
+    "HALLMARK_MYOGENESIS",
+    "HALLMARK_SPERMATOGENESIS",
+    "HALLMARK_APICAL_JUNCTION",
+    "HALLMARK_APICAL_SURFACE",
+    "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+    
+    # Other 
+    "HALLMARK_ESTROGEN_RESPONSE_EARLY",
+    "HALLMARK_ESTROGEN_RESPONSE_LATE",
+    "HALLMARK_ANDROGEN_RESPONSE",
+    "HALLMARK_PROTEIN_SECRETION",
+    "HALLMARK_COAGULATION",
+    "HALLMARK_PANCREAS_BETA_CELLS"
+  ),
+  Category = c(
+    rep("Proliferation & Cell Cycle", 6),
+    rep("Growth Signaling & Oncogenic Pathways", 8),
+    rep("Metabolic Reprogramming", 9),
+    rep("Stress Response & Hypoxia", 7),
+    rep("Immune & Inflammatory Signaling", 8),
+    rep("Angiogenesis & Development", 6),
+    rep("Other", 6)
+  ),
+  stringsAsFactors = FALSE
+)
+
+
+
+
+rank_fun <- function(res) {
+  stats <- res$logFC
+  names(stats) <- rownames(res)
+  stats[!is.na(stats)]
+}
+
+# Run FGSEA for all comparisons using the same min/max size
+
+min_genes <- 5   # set to small number to ensure small hallmark pathways are included
+max_genes <- 500
+
+fgsea_results <- list()
+
+comparisons <- list(
+  "3Dvs2D" = res_3Dvs2D,
+  "2DvsInVivo" = res_2DvsInVivo,
+  "3DvsInVivo" = res_3DvsInVivo,
+  "InVivovs2D" = res_InVivovs2D
+)
+
+hallmark_msig <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, gene_symbol) %>%       # keep only needed cols
+  split(x = .$gene_symbol, f = .$gs_name)       # split into list of vectors
+
+for(comp in names(comparisons)) {
+  ranks <- rank_fun(comparisons[[comp]])
+  fg <- fgsea(pathways = hallmark_msig, stats = ranks,
+              minSize = min_genes, maxSize = max_genes, nperm = 10000)
+  
+  fgsea_results[[comp]] <- fg %>%
+    dplyr::select(pathway, NES, padj) %>%
+    rename_with(~paste0(., "_", comp), c("NES", "padj"))
+}
+
+
+df_combined <- Reduce(function(x, y) full_join(x, y, by = "pathway"), fgsea_results)
+
+
+# Merge with hallmark_refined categories
+df_scatter <- df_combined %>%
+  left_join(hallmark_to_category, by = c("pathway" = "Pathway")) %>%
+  mutate(
+    Category = ifelse(is.na(Category), "Other", Category),
+    point_size = -log10(pmin(padj_3Dvs2D, padj_InVivovs2D) + 1e-10)
+  )
+
+
+# Original colors
+category_colors <- c(
+  
+   "Growth Signaling & Oncogenic Pathways" = "#f94144",
+      "Metabolic Reprogramming" = "#f8961e" ,
+    "Stress Response & Hypoxia" = "#f9c74f",
+    "Angiogenesis & Development" = "#90be6d",
+  "Proliferation & Cell Cycle" = "#4682b4",
+
+    "Immune & Inflammatory Signaling" = "#8c6bb1",
+    "Other" = "gray70"
+)
+
+
+# Map wrapped labels separately
+wrapped_labels <- c(
+ "Growth Signaling &\nOncogenic Pathways",
+  "Metabolic Reprogramming",
+  "Stress Response & Hypoxia",
+  "Angiogenesis & Development",
+   "Proliferation & Cell Cycle",
+  "Immune & Inflammatory \nSignaling",
+  "Other"
+)
+
+df_scatter$Category <- factor(df_scatter$Category,
+                              levels = c(
+                                "Growth Signaling & Oncogenic Pathways",
+                                "Metabolic Reprogramming",
+                                "Stress Response & Hypoxia",
+                                "Angiogenesis & Development",
+                                "Proliferation & Cell Cycle",
+                                "Immune & Inflammatory Signaling",
+                                "Other"
+                              ))
+
+# NES Scatterplot
+png(file.path(results_dir, "NES_Scatterplot_Concordance.png"), width = 4000, height = 2500, res = 300)
+ggplot(df_scatter, aes(x = NES_3Dvs2D, y = NES_InVivovs2D, color = Category)) +
+  geom_jitter(aes(size = point_size), width = 0.05, height = 0.05, alpha = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = 0, color = "gray50") +
+  geom_vline(xintercept = 0, color = "gray50") +
+  scale_color_manual(values = category_colors, labels = wrapped_labels) +
+  scale_size_continuous(range = c(2, 6), name = "-log10(FDR)") +
+  labs(
+    x = "NES (3D vs 2D)",
+    y = "NES (In Vivo vs 2D)",
+    color = "Hallmark Category",
+    title = "NES-Based Hallmark Agreement: 3D vs In Vivo",
+    subtitle = "Points near diagonal = strong mimicry; size = significance"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "left",
+    panel.border = element_rect(color = "black", fill = NA, size = 1),
+    axis.text.y = element_text(size = 16),
+    axis.text.x = element_text(size = 16)
+  )
+dev.off()
+
+```
+
+```{r}
+# boxplot of residuals 
+
+# Calculate residuals: difference from diagonal (In Vivo NES vs 3D NES)
+df_scatter <- df_scatter %>%
+  mutate(Residual = NES_InVivovs2D - NES_3Dvs2D)  # vertical distance from y = x
+
+# Summarize median residuals per category to order
+category_order <- df_scatter %>%
+  group_by(Category) %>%
+  summarize(median_resid = median(Residual, na.rm = TRUE)) %>%
+  arrange(median_resid) %>%
+  pull(Category)
+
+# Convert Category to factor with the ordering
+df_scatter$Category <- factor(df_scatter$Category, levels = category_order)
+
+# Plot boxplot
+ggplot(df_scatter, aes(x = Category, y = Residual, fill = Category)) +
+  geom_boxplot(alpha = 0.7) +
+  coord_flip() +   # horizontal for readability
+  scale_fill_manual(values = c(
+    "Proliferation & Cell Cycle" = "#4682b4",
+    "Growth Signaling & Oncogenic Pathways" = "#f94144",
+    "Metabolic Reprogramming" = "#f9c74f",
+    "Stress Response & Hypoxia" = "#90be6d",
+    "Immune & Inflammatory Signaling" = "#8c6bb1",
+    "Angiogenesis & Development" = "#f8961e",
+    "Other" = "gray70"
+  )) +
+  labs(
+    x = "Hallmark Category",
+    y = "Residuals (In Vivo NES - 3D NES)",
+    title = "Residuals per Hallmark Category",
+    subtitle = "Sorted by median residual, lowest to highest"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12)
+  )
+
+
+# Step 1: Compute residuals per pathway
+# residual = NES_3Dvs2D - NES_InVivovs2D
+df_residuals <- df_scatter %>%
+  mutate(
+    residual = NES_3Dvs2D - NES_InVivovs2D,
+    abs_residual = abs(residual),
+    weight = -log10(pmin(padj_3Dvs2D, padj_2DvsInVivo) + 1e-10), # significance weighting
+    weighted_residual = abs_residual / (weight + 1) # prevent division by zero
+  )
+
+# Step 2: Summarize per category
+category_mimicry <- df_residuals %>%
+  group_by(Category) %>%
+  summarise(
+    mean_residual = mean(abs_residual, na.rm = TRUE),
+    median_residual = median(abs_residual, na.rm = TRUE),
+    mean_weighted_residual = mean(weighted_residual, na.rm = TRUE),
+    n_pathways = n()
+  ) %>%
+  arrange(mean_weighted_residual) # smaller = better mimicry
+
+# Step 3: Boxplot of weighted residuals by category (sorted)
+
+png(file.path(results_dir, "Weighted_Residuals.png"), width = 3000, height = 2500, res = 300)
+df_residuals %>%
+  ggplot(aes(x = reorder(Category, weighted_residual, FUN = median), y = weighted_residual, fill = Category)) +
+  geom_boxplot() +
+  geom_point() +
+  coord_flip() +
+  scale_fill_manual(values = category_colors) +
+  labs(
+    x = "",
+    y = "Weighted Residual",
+    title = "Pathway Residuals by Category"
+  ) +
+  theme_minimal(base_size = 20) +
+  theme(
+    legend.position = "none",
+    panel.border = element_rect(color = "black", fill = NA, size = 1),
+    axis.text.y = element_text(size = 18),
+    axis.text.x = element_text(size = 18)
+  )
+dev.off()
+```
+
+```{r}
+# determining what labels to include to Fig 5
+
+# Clean pathway names
+
+df_scatter <- df_scatter %>%
+  mutate(pathway_clean = gsub("^HALLMARK_", "", pathway),
+         pathway_clean = gsub("_", " ", pathway_clean))
+
+
+# Select number of labels per category
+highlight_cats <- c(
+  "Immune & Inflammatory Signaling",
+  "Other",
+  "Proliferation & Cell Cycle",
+  "Angiogenesis & Development",
+  "Stress Response & Hypoxia",
+  "Metabolic Reprogramming",
+  "Growth Signaling & Oncogenic Pathways"
+)
+
+top_labels <- df_scatter %>%
+  filter(Category %in% highlight_cats) %>%
+  group_by(Category) %>%
+  slice_max(order_by = point_size, n = 15, with_ties = FALSE) %>%
+  ungroup()
+
+
+# NES Scatterplot with clean labels
+png(file.path(results_dir, "NES_Scatterplot_labeled_top4.png"), width = 5000, height = 3000, res = 300)
+ggplot(df_scatter, aes(x = NES_3Dvs2D, y = NES_InVivovs2D, color = Category)) +
+  geom_point(aes(size = point_size), alpha = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = 0, color = "gray50") +
+  geom_vline(xintercept = 0, color = "gray50") +
+  # highlight labels
+  geom_text_repel(
+    data = top_labels,
+    aes(label = pathway_clean),
+    size = 4,
+    box.padding = 0.4,
+    point.padding = 0.3,
+    segment.color = "gray50",
+    max.overlaps = Inf
+  ) +
+scale_color_manual(values = category_colors,
+                     labels = wrapped_labels) +
+  scale_size_continuous(range = c(2,6), name = "-log10(FDR)") +
+  labs(
+    x = "NES (3D vs 2D)",
+    y = "NES (In Vivo vs 2D)",
+    color = "Hallmark Category",
+    title = "NES-Based Hallmark Agreement: 3D vs In Vivo",
+    subtitle = "Top 3 pathways labeled per selected categories"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "left",
+    panel.border = element_rect(color = "black", fill = NA, size = 1),
+    axis.text.y = element_text(size = 16),
+    axis.text.x = element_text(size = 16)
+  )
+dev.off()
+
+```
+
+```{r}
+# Save session info for reproducibility
+writeLines(capture.output(sessionInfo()), file.path(results_dir, "sessionInfo.txt"))
+```
