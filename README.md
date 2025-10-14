@@ -10,3 +10,9 @@ Clone the repository and install required R packages:
 ```bash
 git clone https://github.com/suzannelightsey/Lightsey_ScientificReports_2025.git
 cd Lightsey_ScientificReports_2025
+
+If you use this code or parts of it, please cite this repository and relevant R/Bioconductor packages.
+
+**Author**
+Suzanne Lightsey
+J. Crayton Pruitt Family Department of Biomedical Engineering, Univeristy of Florida
