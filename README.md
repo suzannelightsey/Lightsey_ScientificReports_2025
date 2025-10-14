@@ -7,9 +7,8 @@ This repository contains a reproducible RNA-seq analysis and figure generation w
 
 If you use this code or parts of it, please cite this repository and relevant R/Bioconductor packages.
 
-**Author**
-Suzanne Lightsey
-J. Crayton Pruitt Family Department of Biomedical Engineering, Univeristy of Florida
+**Author:**
+Suzanne Lightsey, J. Crayton Pruitt Family Department of Biomedical Engineering, Univeristy of Florida
 
 Clone the repository and install required R packages:
 
